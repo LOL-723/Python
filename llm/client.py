@@ -3,6 +3,7 @@ from typing import Any
 
 from openai import OpenAI
 from core.config import settings
+from llm.tools import TOOL_ARGUMENTS, TOOL_DESCRIPTIONS, TOOL_REGISTRY
 
 
 class LLMClient:
@@ -16,6 +17,16 @@ class LLMClient:
         "addresses, descriptions, summaries, and dates should be strings; ages, counts, "
         "scores, and quantities should be numbers; lists of skills, tags, or items should "
         "be arrays. Never put a number in a name field."
+    )
+    TOOL_ROUTER_PROMPT = (
+        "You are a tool router. Decide whether the user's message needs one of the "
+        "available tools. Match by semantic meaning, not exact wording. For example, "
+        "'现在几点？' means the same thing as '获取当前时间' and should call "
+        "get_current_time. If the user asks for time in another country, city, or "
+        "region, pass that place in arguments.location. Return one valid JSON object "
+        "only with this shape: "
+        '{"tool_calls":[{"name":"tool_name","arguments":{"location":"place"}}]}. '
+        "If no tool is needed, return {\"tool_calls\":[]}."
     )
 
     def __init__(
@@ -91,6 +102,19 @@ class LLMClient:
         if system_prompt and system_prompt.strip():
             messages.append({"role": "system", "content": system_prompt})
 
+        tool_results = self._run_tools_for_json_chat(user_message)
+        if tool_results:
+            messages.append(
+                {
+                    "role": "system",
+                    "content": (
+                        "Tool results are authoritative. Use them to answer the "
+                        "user's request in the final JSON object: "
+                        f"{json.dumps(tool_results, ensure_ascii=False)}"
+                    ),
+                }
+            )
+
         messages.append(
             {
                 "role": "system",
@@ -111,6 +135,72 @@ class LLMClient:
 
         self._validate_json_semantics(data)
         return data
+
+    def _run_tools_for_json_chat(self, user_message: str) -> list[dict[str, Any]]:
+        tool_calls = self._select_tools_for_json_chat(user_message)
+        results: list[dict[str, Any]] = []
+
+        for tool_call in tool_calls:
+            name = tool_call.get("name")
+            arguments = tool_call.get("arguments") or {}
+            if not isinstance(name, str) or name not in TOOL_REGISTRY:
+                continue
+            if not isinstance(arguments, dict):
+                arguments = {}
+
+            result = TOOL_REGISTRY[name](**arguments)
+            results.append(
+                {
+                    "name": name,
+                    "description": TOOL_DESCRIPTIONS.get(name, ""),
+                    "result": result,
+                }
+            )
+
+        return results
+
+    def _select_tools_for_json_chat(self, user_message: str) -> list[dict[str, Any]]:
+        available_tools = [
+            {
+                "name": name,
+                "description": description,
+                "arguments": TOOL_ARGUMENTS.get(name, {}),
+            }
+            for name, description in TOOL_DESCRIPTIONS.items()
+        ]
+        if not available_tools:
+            return []
+
+        response = self.client.chat.completions.create(
+            model=self.model,
+            messages=[
+                {"role": "system", "content": self.TOOL_ROUTER_PROMPT},
+                {
+                    "role": "system",
+                    "content": (
+                        "Available tools: "
+                        f"{json.dumps(available_tools, ensure_ascii=False)}"
+                    ),
+                },
+                {"role": "user", "content": user_message},
+            ],
+            response_format={"type": "json_object"},
+        )
+
+        content = response.choices[0].message.content or '{"tool_calls":[]}'
+        try:
+            data = json.loads(content)
+        except json.JSONDecodeError:
+            return []
+
+        if not isinstance(data, dict):
+            return []
+
+        tool_calls = data.get("tool_calls", [])
+        if not isinstance(tool_calls, list):
+            return []
+
+        return [tool_call for tool_call in tool_calls if isinstance(tool_call, dict)]
 
     def _validate_json_semantics(self, data: dict[str, Any]) -> None:
         for key, value in data.items():
