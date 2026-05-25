@@ -3,12 +3,14 @@ from typing import Any, Literal, TypedDict
 
 from langgraph.graph import END, START, StateGraph
 from openai import OpenAI
+from llm.rag_service import rag_service
 
 from core.config import settings
 from llm.tools import TOOL_ARGUMENTS, TOOL_DESCRIPTIONS, TOOL_REGISTRY
 
 
 RouteName = Literal["rag", "chat", "tool"]
+MAX_VERIFIER_RETRIES = 3
 
 
 class AgentState(TypedDict, total=False):
@@ -34,6 +36,18 @@ TOOL_ROUTER_PROMPT = (
     "only with this shape: "
     '{"tool_calls":[{"name":"tool_name","arguments":{"location":"place"}}]}. '
     'If no tool is needed, return {"tool_calls":[]}.'
+)
+
+VERIFIER_PROMPT = (
+    "You are a strict answer verifier. Decide whether the assistant answer is "
+    "grounded in the provided context and actually answers the user's question. "
+    "For RAG answers, the uploaded document sources are authoritative; mark the "
+    "answer as hallucinated if it adds facts not supported by the sources. For "
+    "tool answers, tool results are authoritative; mark the answer as "
+    "hallucinated if it contradicts or ignores them. For normal chat answers, "
+    "judge relevance, internal consistency, and whether the answer appears to "
+    "invent specific unsupported facts. Return one valid JSON object only with "
+    'this shape: {"has_hallucination":false,"reason":"..."}'
 )
 
 
@@ -85,7 +99,6 @@ def route_decision(state: AgentState) -> Literal["rag_node", "tool_node", "answe
 
 
 def rag_node(state: AgentState) -> AgentState:
-    from llm.rag_service import rag_service
 
     question = state["question"]
     rag_result = rag_service.ask(question)
@@ -161,6 +174,47 @@ def answer_node(state: AgentState) -> AgentState:
     }
 
 
+def verifier_node(state: AgentState) -> AgentState:
+    current_state = dict(state)
+
+    for _ in range(MAX_VERIFIER_RETRIES + 1):
+        verification = _verify_answer(current_state)
+        has_hallucination = verification.get("has_hallucination", True)
+        retry_count = int(current_state.get("retry_count", 0))
+
+        current_state["logs"] = add_log(
+            state=current_state,
+            node="verifier_node",
+            message="answer verification completed",
+            extra={
+                "has_hallucination": has_hallucination,
+                "reason": verification.get("reason", ""),
+                "retry_count": retry_count,
+            },
+        )
+
+        if not has_hallucination:
+            return current_state
+
+        if retry_count >= MAX_VERIFIER_RETRIES:
+            fallback_answer = (
+                "当前回复经过多次校验仍可能存在幻觉或偏题，无法可靠回答。"
+                "请补充更明确的问题、相关文档或可调用工具结果后再试。"
+            )
+            current_state["answer"] = fallback_answer
+            current_state["logs"] = add_log(
+                state=current_state,
+                node="verifier_node",
+                message="max verification retries reached",
+                extra={"max_retries": MAX_VERIFIER_RETRIES},
+            )
+            return current_state
+
+        current_state = _rerun_from_router(current_state, retry_count + 1)
+
+    return current_state
+
+
 def build_graph():
     graph_builder = StateGraph(AgentState)
 
@@ -168,6 +222,7 @@ def build_graph():
     graph_builder.add_node("rag_node", rag_node)
     graph_builder.add_node("tool_node", tool_node)
     graph_builder.add_node("answer_node", answer_node)
+    graph_builder.add_node("verifier_node", verifier_node)
 
     graph_builder.add_edge(START, "router_node")
     graph_builder.add_conditional_edges(
@@ -179,11 +234,116 @@ def build_graph():
             "answer_node": "answer_node",
         },
     )
-    graph_builder.add_edge("rag_node", END)
-    graph_builder.add_edge("tool_node", END)
-    graph_builder.add_edge("answer_node", END)
+    graph_builder.add_edge("rag_node", "verifier_node")
+    graph_builder.add_edge("tool_node", "verifier_node")
+    graph_builder.add_edge("answer_node", "verifier_node")
+    graph_builder.add_edge("verifier_node", END)
 
     return graph_builder.compile()
+
+
+def _verify_answer(state: AgentState) -> dict[str, Any]:
+    answer = state.get("answer", "")
+    if not answer or not answer.strip():
+        return {
+            "has_hallucination": True,
+            "reason": "answer is empty",
+        }
+
+    payload = {
+        "question": state["question"],
+        "route": state.get("route", "chat"),
+        "answer": answer,
+        "context": _verification_context(state),
+    }
+
+    response = _openai_client().chat.completions.create(
+        model=settings.LLM_MODEL,
+        messages=[
+            {"role": "system", "content": VERIFIER_PROMPT},
+            {"role": "user", "content": json.dumps(payload, ensure_ascii=False)},
+        ],
+        response_format={"type": "json_object"},
+    )
+
+    content = response.choices[0].message.content or "{}"
+    try:
+        data = json.loads(content)
+    except json.JSONDecodeError:
+        return {
+            "has_hallucination": True,
+            "reason": "verifier returned invalid JSON",
+        }
+
+    if not isinstance(data, dict):
+        return {
+            "has_hallucination": True,
+            "reason": "verifier returned non-object JSON",
+        }
+
+    return {
+        "has_hallucination": _json_bool(data.get("has_hallucination"), default=True),
+        "reason": str(data.get("reason", "")),
+    }
+
+
+def _json_bool(value: Any, default: bool) -> bool:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        normalized = value.strip().lower()
+        if normalized in {"true", "yes", "1"}:
+            return True
+        if normalized in {"false", "no", "0"}:
+            return False
+    return default
+
+
+def _verification_context(state: AgentState) -> dict[str, Any]:
+    route = state.get("route", "chat")
+    context: dict[str, Any] = {}
+
+    if route == "rag":
+        context["retrieved_docs"] = state.get("retrieved_docs", [])
+        context["rag_retrieval_mode"] = state.get("rag_retrieval_mode")
+    elif route == "tool":
+        context["tool_calls"] = state.get("tool_calls", [])
+        context["tool_results"] = state.get("tool_results", [])
+    else:
+        context["system_prompt"] = state.get("system_prompt")
+
+    return context
+
+
+def _rerun_from_router(state: AgentState, retry_count: int) -> AgentState:
+    retry_state: AgentState = {
+        "question": state["question"],
+        "system_prompt": state.get("system_prompt"),
+        "retry_count": retry_count,
+        "logs": add_log(
+            state=state,
+            node="verifier_node",
+            message="hallucination detected, rerunning from router",
+            extra={"retry_count": retry_count},
+        ),
+    }
+    if state.get("file_info"):
+        retry_state["file_info"] = state["file_info"]
+
+    retry_state = _merge_state(retry_state, router_node(retry_state))
+    next_node = route_decision(retry_state)
+    action_nodes = {
+        "rag_node": rag_node,
+        "tool_node": tool_node,
+        "answer_node": answer_node,
+    }
+    return _merge_state(retry_state, action_nodes[next_node](retry_state))
+
+
+def _merge_state(state: AgentState, update: AgentState) -> AgentState:
+    merged = dict(state)
+    merged.update(update)
+    return merged
 
 
 def _has_rag_intent(question: str) -> bool:
