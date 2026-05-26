@@ -101,6 +101,10 @@ class LLMClient:
             "system_prompt": system_prompt,
             "use_rag": use_rag,
             "retry_count": 0,
+            "verification_count": 0,
+            "answer_retry_count": 0,
+            "route_retry_count": 0,
+            "router_retry_count": 0,
             "logs": [],
         }
         if file_info:
@@ -114,6 +118,7 @@ class LLMClient:
     ) -> dict[str, Any]:
         route = graph_result.get("route", "chat")
         answer = graph_result.get("answer", "")
+        end_status = graph_result.get("end_status")
         use_local_retrieval = route == "rag" and graph_result.get("rag_retrieval_mode") == "local"
 
         try:
@@ -122,6 +127,7 @@ class LLMClient:
             message = f"{answer}(本地检索)" if use_local_retrieval and answer else answer
             return {
                 "route": route,
+                "end_status": end_status,
                 "message": message,
             }
 
@@ -130,10 +136,12 @@ class LLMClient:
                 message = str(parsed_answer.get("message", ""))
                 parsed_answer["message"] = f"{message}(本地检索)"
             parsed_answer["route"] = route
+            parsed_answer["end_status"] = end_status
             return parsed_answer
 
         result = {
             "route": route,
+            "end_status": end_status,
             "data": parsed_answer,
         }
         if use_local_retrieval:
