@@ -103,7 +103,9 @@ class LLMClient:
             "retry_count": 0,
             "verification_count": 0,
             "answer_retry_count": 0,
-            "route_retry_count": 0,
+            "rag_retry_count": 0,
+            "tool_retry_count": 0,
+            "chat_retry_count": 0,
             "router_retry_count": 0,
             "logs": [],
         }

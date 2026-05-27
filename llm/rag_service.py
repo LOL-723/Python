@@ -114,20 +114,25 @@ class RagService:
         answer = self.generate(question, [source.content for source in reranked])
         return RagAskResponse(answer=answer, sources=reranked, retrieval_mode=retrieval_mode)
 
+    #rag_node召回入口，返回值为从向量数据库中召回的片段
     def retrieve_with_mode(self, query: str, top_k: int) -> tuple[list[RagSource], str]:
-        query_embedding = self.embed_text(query)
+        query_embedding = self.embed_text(query)#选择使用的RAG方式(本地/Chroma)，并将问题转换为向量
         collection = self._collection_or_none()
         if collection is None:
             # Fallback retrieval: when Chroma is unavailable in the running
             # environment, search saved chunks.json files directly.
             return self._retrieve_from_local_chunks(query_embedding, top_k), "local"
 
+        #query_embedding自身就是问题的向量，但由于chroma支持一次性多问题，返回的需要是一个向量列表，因此用query_embeddings，从[X]变成[ [X] ]
         results = collection.query(query_embeddings=[query_embedding], n_results=top_k)
+        #由于问题有可能为多个，所以documents，metadatas，ids也都是列表，但"问题向量"只有一个，所以拿[0]
+        #results.get("documents") or [[]]代表能拿到"documents"就拿。拿不到就用[[]]这个空列表代替，避免执行报错
         documents = (results.get("documents") or [[]])[0]
         metadatas = (results.get("metadatas") or [[]])[0]
         ids = (results.get("ids") or [[]])[0]
 
         sources = []
+        #匹对列表，每次都拿id[X]，documents[X]，metadatas[X]
         for chunk_id, content, metadata in zip(ids, documents, metadatas):
             metadata = metadata or {}
             sources.append(
@@ -145,13 +150,20 @@ class RagService:
         sources, _ = self.retrieve_with_mode(query, top_k)
         return sources
 
+    #rag_node重排入口，返回重排后的相关性最高的top_k个片段
     def rerank(self, query: str, sources: list[RagSource], top_k: int) -> list[RagSource]:
         if not sources:
             return []
         if self.rerank_model is None:
             return sources[:top_k]
+        
+        #每个召回片段和问题组键值对
         pairs = [(query, source.content) for source in sources]
+        #然后用Transformer模型进行预测键值对相关性数值
         scores = self.rerank_model.predict(pairs)
+        #将数值排序，最后只返回相关性最高的top_k个片段
+        #zip(sources, scores)将两个列表配对成元组，例：sources=["A","B","C"]，scores=[0.9,0.8,0.7]，组合后[[A,0.9][B,0.8]]
+        #key=lambda item: float(item[1])，按每个元组的第二个元素（分数）排序
         ranked = sorted(zip(sources, scores), key=lambda item: float(item[1]), reverse=True)
         return [source for source, _ in ranked[:top_k]]
 
@@ -188,6 +200,8 @@ class RagService:
             start = max(end - self.chunk_overlap, start + 1)
         return chunks
 
+    #能使用Chroma就使用Chroma
+    #embedding_model是property，这时的embedding拿到的结果还是NumPy 数组(非原生列表)，return加上tolist()才变成向量[]，原生列表
     def embed_text(self, text: str) -> list[float]:
         if self.embedding_model is None:
             return self._hash_embedding(text)

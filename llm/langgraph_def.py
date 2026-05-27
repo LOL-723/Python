@@ -33,7 +33,9 @@ class AgentState(TypedDict, total=False):
     retry_count: int
     verification_count: int
     answer_retry_count: int
-    route_retry_count: int
+    rag_retry_count: int
+    tool_retry_count: int
+    chat_retry_count: int
     router_retry_count: int
     verifier_next: VerifierNext
     end_status: EndStatus
@@ -131,6 +133,7 @@ def rag_node(state: AgentState) -> AgentState:
         retrieved,
         settings.RAG_RERANK_TOP_K,
     )
+    #model_dump() 的作用就是把 Pydantic 对象转成 Python 原生 dict
     sources = [source.model_dump() for source in reranked]
 
     return {
@@ -302,7 +305,9 @@ def verifier_decision(state: AgentState) -> VerifierNext:
 
 def _next_verifier_step(state: AgentState) -> tuple[VerifierNext, AgentState]:
     answer_retry_count = int(state.get("answer_retry_count", 0))
-    route_retry_count = int(state.get("route_retry_count", 0))
+    rag_retry_count = int(state.get("rag_retry_count", 0))
+    tool_retry_count = int(state.get("tool_retry_count", 0))
+    chat_retry_count = int(state.get("chat_retry_count", 0))
     router_retry_count = int(state.get("router_retry_count", 0))
 
     if router_retry_count > 0:
@@ -314,12 +319,12 @@ def _next_verifier_step(state: AgentState) -> tuple[VerifierNext, AgentState]:
         return "answer_node", {"answer_retry_count": answer_retry_count + 1}
 
     route = state.get("route", "chat")
-    if route == "rag" and route_retry_count < MAX_RAG_TOOL_RETRIES:
-        return "rag_node", {"route_retry_count": route_retry_count + 1}
-    if route == "tool" and route_retry_count < MAX_RAG_TOOL_RETRIES:
-        return "tool_selector_node", {"route_retry_count": route_retry_count + 1}
-    if route == "chat" and route_retry_count < MAX_CHAT_RETRIES:
-        return "answer_node", {"route_retry_count": route_retry_count + 1}
+    if route == "rag" and rag_retry_count < MAX_RAG_TOOL_RETRIES:
+        return "rag_node", {"rag_retry_count": rag_retry_count + 1}
+    if route == "tool" and tool_retry_count < MAX_RAG_TOOL_RETRIES:
+        return "tool_selector_node", {"tool_retry_count": tool_retry_count + 1}
+    if route == "chat" and chat_retry_count < MAX_CHAT_RETRIES:
+        return "answer_node", {"chat_retry_count": chat_retry_count + 1}
 
     if router_retry_count < MAX_ROUTER_RETRIES:
         return "router_node", {"router_retry_count": router_retry_count + 1}
